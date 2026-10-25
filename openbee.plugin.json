@@ -1,0 +1,36 @@
+{
+  "protocol_version": 1,
+  "id": "telegram",
+  "name": { "en": "Telegram", "zh": "Telegram" },
+  "description": { "en": "Telegram bot channel", "zh": "Telegram 机器人渠道" },
+  "command": ["node", "dist/index.js"],
+  "config": [
+    {
+      "key": "token",
+      "type": "secret",
+      "required": true,
+      "label": { "en": "Bot token", "zh": "Bot Token" },
+      "help": { "en": "Get a token from @BotFather on Telegram", "zh": "从 Telegram 的 @BotFather 获取 Token" }
+    },
+    {
+      "key": "auth_code",
+      "type": "string",
+      "random_default": true,
+      "label": { "en": "Auth code (empty to allow everyone)", "zh": "授权码（留空则不限制用户）" },
+      "help": { "en": "Users must send /auth <code> before using the bot; leave empty to allow everyone", "zh": "用户需发送 /auth <code> 才能使用 bot；留空则不限制" }
+    },
+    {
+      "key": "max_media_size",
+      "type": "int",
+      "default": 52428800,
+      "label": { "en": "Max attachment size (bytes)", "zh": "附件大小上限（字节）" }
+    },
+    {
+      "key": "api_base_url",
+      "type": "string",
+      "default": "https://api.telegram.org",
+      "label": { "en": "Bot API server URL", "zh": "Bot API 服务地址" },
+      "help": { "en": "Change only for a self-hosted Bot API server or a reverse proxy", "zh": "仅在使用自建 Bot API 服务或反向代理时修改" }
+    }
+  ]
+}

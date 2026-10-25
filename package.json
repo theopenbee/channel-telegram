@@ -1,0 +1,45 @@
+{
+  "name": "@theopenbee/channel-telegram",
+  "version": "0.1.0",
+  "description": "Telegram channel plugin for openbee",
+  "keywords": [
+    "openbee",
+    "openbee-plugin",
+    "telegram"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/theopenbee/channel-telegram.git"
+  },
+  "homepage": "https://github.com/theopenbee/channel-telegram#readme",
+  "bugs": {
+    "url": "https://github.com/theopenbee/channel-telegram/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "openbee.plugin.json"
+  ],
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@theopenbee/channel-sdk": "^0.2.0",
+    "undici": "^7.30.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
