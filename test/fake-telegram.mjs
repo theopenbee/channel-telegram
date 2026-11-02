@@ -6,6 +6,8 @@ export async function startFakeTelegram(handlers = {}) {
   const calls = [];
   const waiters = [];
   const files = new Map();
+  const drops = new Map();
+  const fileRequests = [];
   const updates = [];
   const pollers = [];
 
@@ -26,6 +28,12 @@ export async function startFakeTelegram(handlers = {}) {
     };
     const fileMatch = req.url.match(/^\/file\/bot([^/]+)\/(.+)$/);
     if (fileMatch) {
+      fileRequests.push(fileMatch[2]);
+      const left = drops.get(fileMatch[2]) ?? 0;
+      if (left > 0) {
+        drops.set(fileMatch[2], left - 1);
+        return res.socket.destroy();
+      }
       const data = files.get(fileMatch[2]);
       if (!data) return send(404, { ok: false });
       res.writeHead(200);
@@ -83,6 +91,10 @@ export async function startFakeTelegram(handlers = {}) {
     url: `http://127.0.0.1:${port}`,
     calls,
     files,
+    fileRequests,
+    dropFile(path, times) {
+      drops.set(path, times);
+    },
     push(update) {
       updates.push(update);
       flushPollers();

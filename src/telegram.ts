@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 
 import { ConfigError, type Attachment, type ChannelContext, type ChannelDefinition, type SendRequest } from "@theopenbee/channel-sdk";
 
-import { BotApi, DEFAULT_API_BASE_URL, TelegramError, sleep } from "./api.js";
+import { BotApi, DEFAULT_API_BASE_URL, TelegramError, isRetryableDownload, retryWithBackoff, sleep } from "./api.js";
 import { AuthStore, codeMatches } from "./auth.js";
 import {
   chunkText,
@@ -26,6 +26,8 @@ const POLL_TIMEOUT_SECONDS = 50;
 const POLL_REQUEST_TIMEOUT = (POLL_TIMEOUT_SECONDS + 20) * 1000;
 const MIN_POLL_BACKOFF = 1000;
 const MAX_POLL_BACKOFF = 30_000;
+const DOWNLOAD_ATTEMPTS = 3;
+const DOWNLOAD_RETRY_DELAY = 500;
 
 const BOT_COMMANDS = [{ command: "clear", description: "Clear conversation history" }];
 
@@ -93,7 +95,13 @@ export function createTelegramChannel(): ChannelDefinition {
     return true;
   };
 
-  const downloadAttachment = async (ctx: ChannelContext, m: Message): Promise<Attachment[]> => {
+  const fetchFile = async (fileId: string, signal: AbortSignal): Promise<{ data: Uint8Array; filePath: string }> => {
+    const info = await api!.call<TelegramFile>("getFile", { file_id: fileId }, signal);
+    if (!info.file_path) throw new Error("telegram returned no file path");
+    return { data: await api!.download(info.file_path, cfg.maxMediaSize, signal), filePath: info.file_path };
+  };
+
+  const downloadAttachment = async (ctx: ChannelContext, m: Message, signal: AbortSignal): Promise<Attachment[]> => {
     const incoming = incomingFile(m);
     if (!incoming) return [];
     const { type, file, name } = incoming;
@@ -101,10 +109,17 @@ export function createTelegramChannel(): ChannelDefinition {
       if (file.file_size !== undefined && file.file_size > cfg.maxMediaSize) {
         throw new Error(`file larger than ${cfg.maxMediaSize} bytes`);
       }
-      const info = await api!.call<TelegramFile>("getFile", { file_id: file.file_id });
-      if (!info.file_path) throw new Error("telegram returned no file path");
-      const data = await api!.download(info.file_path, cfg.maxMediaSize);
-      const path = await ctx.saveMedia(data, extension(name, info.file_path));
+      const { data, filePath } = await retryWithBackoff(() => fetchFile(file.file_id, signal), {
+        attempts: DOWNLOAD_ATTEMPTS,
+        delay: DOWNLOAD_RETRY_DELAY,
+        signal,
+        shouldRetry: (err) => {
+          if (!isRetryableDownload(err)) return false;
+          ctx.log.warn("attachment download failed, retrying", { name: name ?? "", error: errorText(err) });
+          return true;
+        },
+      });
+      const path = await ctx.saveMedia(data, extension(name, filePath));
       return [{ type, path, name }];
     } catch (err) {
       ctx.log.warn("attachment download failed", { name: name ?? "", error: errorText(err) });
@@ -112,7 +127,7 @@ export function createTelegramChannel(): ChannelDefinition {
     }
   };
 
-  const handleMessage = async (ctx: ChannelContext, update: Update, m: Message) => {
+  const handleMessage = async (ctx: ChannelContext, update: Update, m: Message, signal: AbortSignal) => {
     if (m.migrate_to_chat_id) {
       ctx.migrateChat(String(m.chat.id), String(m.migrate_to_chat_id));
       return;
@@ -131,7 +146,7 @@ export function createTelegramChannel(): ChannelDefinition {
     });
 
     const text = m.text ?? m.caption ?? "";
-    const attachments = await downloadAttachment(ctx, m);
+    const attachments = await downloadAttachment(ctx, m, signal);
     if (!text && attachments.length === 0) return;
 
     const context: Record<string, unknown> = { chat_type: m.chat.type, sender_name: senderName(m) };
@@ -177,7 +192,7 @@ export function createTelegramChannel(): ChannelDefinition {
         offset = update.update_id + 1;
         if (!update.message) continue;
         try {
-          await handleMessage(ctx, update, update.message);
+          await handleMessage(ctx, update, update.message, signal);
         } catch (err) {
           ctx.log.error("handle message failed", { error: errorText(err) });
         }

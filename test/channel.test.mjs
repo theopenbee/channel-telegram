@@ -261,3 +261,75 @@ test("oversized outbound media fails the send", async (t) => {
   const res = await p.request("send", { session_key: "telegram:1:1", chat_id: "1", session_scope: "1", proactive: true, media: { path: file, name: "big.bin" } });
   assert.match(res.error.message, /file too large/);
 });
+
+const documentUpdate = (updateId, fileId, extra = {}) => ({
+  update_id: updateId,
+  message: { message_id: 1, date: 1700000000, chat: group, from: user, document: { file_id: fileId, file_name: "a.txt", ...extra } },
+});
+const inboundFor = (p, id) => p.waitFor((m) => m.method === "inbound" && m.params.message_id === id).then((m) => m.params);
+const retryLogs = (p) => p.waitFor((m) => m.method === "log" && m.params.message === "attachment download failed, retrying");
+
+test("a dropped file download is retried until the file arrives", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  tg.files.set("files/flaky", Buffer.from("payload"));
+  tg.dropFile("files/flaky", 2);
+  tg.push(documentUpdate(30, "flaky"));
+  const msg = await inboundFor(p, "30:1");
+  assert.equal(readFileSync(msg.attachments[0].path, "utf8"), "payload");
+  assert.equal(tg.fileRequests.length, 3);
+  assert.equal((await retryLogs(p)).params.level, "warn");
+});
+
+test("a failing getFile is retried", async (t) => {
+  let failures = 1;
+  const tg = await startFakeTelegram({
+    getFile: () => (failures-- > 0 ? { ok: false, error_code: 502, description: "Bad Gateway" } : undefined),
+  });
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  tg.files.set("files/ok", Buffer.from("payload"));
+  tg.push(documentUpdate(31, "ok"));
+  const msg = await inboundFor(p, "31:1");
+  assert.equal(readFileSync(msg.attachments[0].path, "utf8"), "payload");
+  assert.equal(tg.calls.filter((c) => c.method === "getFile").length, 2);
+});
+
+test("a download that keeps failing stops after three attempts", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  tg.dropFile("files/down", 99);
+  tg.push(documentUpdate(32, "down"));
+  const msg = await inboundFor(p, "32:1");
+  assert.deepEqual(msg.attachments, [{ type: "document", path: "", name: "a.txt" }]);
+  assert.equal(tg.fileRequests.length, 3);
+});
+
+test("oversized files and rejected file ids are not retried", async (t) => {
+  const tg = await startFakeTelegram({
+    getFile: (call) => (call.body.file_id === "rejected" ? { ok: false, error_code: 400, description: "Bad Request: file is too big" } : undefined),
+  });
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  tg.files.set("files/big", Buffer.alloc(2048));
+  tg.push(documentUpdate(33, "big"));
+  tg.push(documentUpdate(34, "rejected"));
+  assert.deepEqual((await inboundFor(p, "33:1")).attachments, [{ type: "document", path: "", name: "a.txt" }]);
+  assert.deepEqual((await inboundFor(p, "34:1")).attachments, [{ type: "document", path: "", name: "a.txt" }]);
+  assert.equal(tg.fileRequests.length, 1);
+  assert.equal(tg.calls.filter((c) => c.method === "getFile" && c.body.file_id === "rejected").length, 1);
+});
+
+test("stopping the channel cancels a pending download retry", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  tg.dropFile("files/down", 99);
+  tg.push(documentUpdate(35, "down"));
+  await retryLogs(p);
+  p.child.stdin.end();
+  await p.exited;
+  assert.equal(tg.fileRequests.length, 1);
+});

@@ -22,6 +22,18 @@ export class TelegramError extends Error {
   }
 }
 
+export class FileTooLargeError extends Error {
+  constructor(maxSize: number) {
+    super(`file larger than ${maxSize} bytes`);
+    this.name = "FileTooLargeError";
+  }
+}
+
+export function isRetryableDownload(err: unknown): boolean {
+  if (err instanceof FileTooLargeError) return false;
+  return !(err instanceof TelegramError && err.code >= 400 && err.code < 500);
+}
+
 export interface UploadFile {
   field: string;
   name: string;
@@ -49,6 +61,26 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       { once: true },
     );
   });
+}
+
+export interface RetryOptions {
+  attempts: number;
+  delay: number;
+  signal?: AbortSignal;
+  shouldRetry: (err: unknown) => boolean;
+}
+
+export async function retryWithBackoff<T>(fn: () => Promise<T>, { attempts, delay, signal, shouldRetry }: RetryOptions): Promise<T> {
+  let wait = delay;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= attempts || !shouldRetry(err)) throw err;
+    }
+    await sleep(wait, signal);
+    wait *= 2;
+  }
 }
 
 function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
@@ -103,7 +135,7 @@ export class BotApi {
       size += chunk.byteLength;
       if (size > maxSize) {
         await res.body.cancel().catch(() => undefined);
-        throw new Error(`file larger than ${maxSize} bytes`);
+        throw new FileTooLargeError(maxSize);
       }
       chunks.push(chunk);
     }
