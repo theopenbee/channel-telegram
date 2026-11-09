@@ -21,6 +21,8 @@ Telegram channel for openbee, built on [`@theopenbee/channel-sdk`](https://www.n
 
 ## Install
 
+Install it from **Settings → Plugins → Marketplace**, or run:
+
 ```sh
 openbee plugin install @theopenbee/channel-telegram
 ```
@@ -34,22 +36,14 @@ npm install
 openbee plugin install "$(pwd)"
 ```
 
-Then enable it with `openbee config`, or add it to `config.yaml` and restart openbee. A config written for the built-in channel works unchanged:
+Then fill in its settings and enable it under **Settings → Plugins** in the desktop app or the web console, or run `openbee plugin configure telegram`. Setup guide: https://theopenbee.com/docs/chat-apps/telegram/
 
-```yaml
-bee:
-  platforms:
-    telegram:
-      enabled: true
-      bot_name: OpenBee
-      token: "<bot token>"
-      auth_code: "<code users send with /auth>"
-```
+Settings, also accepted as `openbee plugin configure telegram --set key=value`:
 
 | Key | Default | |
 |---|---|---|
 | `token` | | Bot token from @BotFather. Required. |
-| `auth_code` | empty | Code for `/auth`; empty lets everyone use the bot. `openbee config` suggests a random one. |
+| `auth_code` | random | Code for `/auth`. A random one is filled in on first save; empty lets everyone use the bot. |
 | `max_media_size` | `52428800` | Largest attachment, in bytes, downloaded or sent. |
 | `api_base_url` | `https://api.telegram.org` | Bot API server, for a self-hosted server or a reverse proxy. |
 
