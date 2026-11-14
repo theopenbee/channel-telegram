@@ -91,9 +91,16 @@ test("startup registers commands and dispatches topic messages", async (t) => {
   const tg = await startFakeTelegram();
   t.after(() => tg.close());
   const { p, res, dirs } = await initialized(t, tg);
-  assert.deepEqual(res.result, { protocol_version: 1 });
-  const commands = await tg.waitFor((c) => c.method === "setMyCommands");
-  assert.deepEqual(commands.body.commands, [{ command: "clear", description: "Clear conversation history" }]);
+  assert.deepEqual(res.result, { protocol_version: 1, capabilities: { buttons: true } });
+  await tg.waitFor((c) => c.method === "setMyCommands" && c.body.language_code === "zh");
+  const commands = tg.calls.filter((c) => c.method === "setMyCommands");
+  assert.equal(commands.length, 2);
+  assert.equal(commands[0].body.language_code, undefined);
+  assert.deepEqual(
+    commands[0].body.commands.map((c) => c.command),
+    ["stop", "clear", "status", "list", "engine", "cancel"],
+  );
+  assert.equal(commands[1].body.commands[2].description, "查看上下文和运行中的任务");
 
   tg.files.set("files/big", Buffer.alloc(10));
   tg.push({
@@ -332,4 +339,133 @@ test("stopping the channel cancels a pending download retry", async (t) => {
   p.child.stdin.end();
   await p.exited;
   assert.equal(tg.fileRequests.length, 1);
+});
+
+const privateChat = { id: 789, type: "private" };
+const stranger = { id: 555, is_bot: false, first_name: "Eve" };
+const clearButtons = [
+  { label: "Clear", text: "/clear", style: "danger" },
+  { label: "Cancel", text: "/clear cancel" },
+];
+
+async function sendWithButtons(p, content = "Clear the session?", buttons = clearButtons) {
+  const raw = JSON.stringify({ update_id: 1, message: { message_id: 7, chat: { id: 789 } } });
+  const res = await p.request("send", {
+    session_key: "telegram:789:789",
+    chat_id: "789",
+    session_scope: "789",
+    proactive: false,
+    reply_to: { message_id: "1:7", raw },
+    content,
+    buttons,
+  });
+  return Number(res.result.platform_message_id);
+}
+
+function click(tg, updateId, messageId, from, data, text = "Clear the session?") {
+  tg.push({
+    update_id: updateId,
+    callback_query: { id: `cq${updateId}`, from, data, message: { message_id: messageId, date: 1, chat: privateChat, text } },
+  });
+}
+
+test("group commands addressed to the bot lose the bot username", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  tg.push({ update_id: 40, message: { message_id: 1, date: 1, chat: group, from: user, text: "/status@test_bot" } });
+  tg.push({ update_id: 41, message: { message_id: 2, date: 1, chat: group, from: user, text: "/status@other_bot" } });
+  const mine = await p.waitFor((m) => m.method === "inbound" && m.params.message_id === "40:1");
+  const other = await p.waitFor((m) => m.method === "inbound" && m.params.message_id === "41:2");
+  assert.equal(mine.params.text, "/status");
+  assert.equal(other.params.text, "/status@other_bot");
+});
+
+test("buttons go on the last message and are stored", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p, dirs } = await initialized(t, tg);
+  const messageId = await sendWithButtons(p, "a".repeat(5000));
+  const texts = tg.calls.filter((c) => c.method === "sendMessage");
+  assert.equal(texts.length, 2);
+  assert.equal(texts[0].body.reply_markup, undefined);
+  assert.deepEqual(texts[1].body.reply_markup, {
+    inline_keyboard: [[
+      { text: "Clear", callback_data: "ob:0" },
+      { text: "Cancel", callback_data: "ob:1" },
+    ]],
+  });
+  const stored = JSON.parse(readFileSync(join(dirs.dataDir, "buttons.json"), "utf8"));
+  assert.deepEqual(Object.keys(stored), [`789:${messageId}`]);
+  assert.deepEqual(stored[`789:${messageId}`].texts, ["/clear", "/clear cancel"]);
+  assert.equal(stored[`789:${messageId}`].scope, "789");
+});
+
+test("a click by the session owner sends the button text and closes the buttons", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p, dirs } = await initialized(t, tg);
+  const messageId = await sendWithButtons(p);
+  click(tg, 50, messageId, user, "ob:1");
+
+  const inbound = await p.waitFor((m) => m.method === "inbound" && m.params.message_id === `button:789:${messageId}`);
+  const { time, ...params } = inbound.params;
+  assert.ok(time > 0);
+  assert.deepEqual(params, {
+    chat_id: "789",
+    sender_id: "789",
+    session_scope: "789",
+    message_id: `button:789:${messageId}`,
+    text: "/clear cancel",
+    raw: JSON.stringify({ update_id: 50, message: { message_id: messageId, chat: { id: 789 } } }),
+    context: { chat_type: "private", sender_name: "Ada L", sender_username: "ada" },
+  });
+  const answer = await tg.waitFor((c) => c.method === "answerCallbackQuery");
+  assert.deepEqual(answer.body, { callback_query_id: "cq50" });
+  const edit = await tg.waitFor((c) => c.method === "editMessageText");
+  assert.deepEqual(edit.body, { chat_id: 789, message_id: messageId, text: "Clear the session?\n\n✓ Selected: Cancel" });
+  assert.deepEqual(JSON.parse(readFileSync(join(dirs.dataDir, "buttons.json"), "utf8")), {});
+});
+
+test("clicks by someone else are refused", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  const messageId = await sendWithButtons(p);
+  click(tg, 60, messageId, stranger, "ob:0");
+  const answer = await tg.waitFor((c) => c.method === "answerCallbackQuery");
+  assert.deepEqual(answer.body, { callback_query_id: "cq60", text: "Only the person who asked can choose" });
+  click(tg, 61, messageId, user, "ob:0");
+  const inbound = await p.waitFor((m) => m.method === "inbound" && m.params.message_id === `button:789:${messageId}`);
+  assert.equal(inbound.params.text, "/clear");
+  await tg.waitFor((c) => c.method === "editMessageText");
+  assert.equal(tg.calls.filter((c) => c.method === "answerCallbackQuery").length, 2);
+});
+
+test("unknown buttons expire and lose their keyboard", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const { p } = await initialized(t, tg);
+  click(tg, 70, 99, user, "ob:0");
+  const answer = await tg.waitFor((c) => c.method === "answerCallbackQuery");
+  assert.deepEqual(answer.body, { callback_query_id: "cq70", text: "This button has expired" });
+  const edit = await tg.waitFor((c) => c.method === "editMessageReplyMarkup");
+  assert.deepEqual(edit.body, { chat_id: 789, message_id: 99, reply_markup: { inline_keyboard: [] } });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(p.child.exitCode, null);
+});
+
+test("stored buttons still work after a restart", async (t) => {
+  const tg = await startFakeTelegram();
+  t.after(() => tg.close());
+  const dirs = setup();
+  const first = await initialized(t, tg, {}, dirs);
+  const messageId = await sendWithButtons(first.p);
+  first.p.child.stdin.end();
+  await first.p.exited;
+
+  const { p } = await initialized(t, tg, {}, dirs);
+  click(tg, 80, messageId, user, "ob:0");
+  const inbound = await p.waitFor((m) => m.method === "inbound" && m.params.message_id === `button:789:${messageId}`);
+  assert.equal(inbound.params.text, "/clear");
 });

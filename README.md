@@ -11,7 +11,8 @@ Telegram channel for openbee, built on [`@theopenbee/channel-sdk`](https://www.n
 - Photos, documents, audio, voice notes, videos, video notes and stickers up to `max_media_size` bytes are downloaded into openbee's media directory; captions become the message text. The Bot API itself only serves files up to 20 MB.
 - Replies longer than 4096 characters are split, preferring line breaks. Text is sent first, then the file. Images Telegram refuses as photos are sent as documents.
 - When a group is upgraded to a supergroup, openbee moves its pending and scheduled tasks to the new chat id.
-- The bot menu gets a `/clear` command.
+- The bot menu lists `/stop`, `/clear`, `/status`, `/list`, `/engine` and `/cancel` (plus `/auth` when `auth_code` is set), in English and Chinese. In groups, `/status@<bot username>` works like `/status`.
+- Messages with buttons (the `/clear` confirmation, choices offered by a worker or Bee, `/status`, `/engine`, `/cancel`) get an inline keyboard. Only the user the message answers can click; the click counts as their reply, and the buttons are replaced by the choice. Buttons are kept in the plugin data directory for 90 days, so they still work after a restart.
 - `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` in openbee's environment are honoured.
 
 ## Create the bot

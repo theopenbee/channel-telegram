@@ -47,9 +47,27 @@ export interface Message {
   migrate_from_chat_id?: number;
 }
 
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+export interface CallbackQuery {
+  id: string;
+  from: User;
+  message?: Message;
+  data?: string;
+}
+
 export interface Update {
   update_id: number;
   message?: Message;
+  callback_query?: CallbackQuery;
+}
+
+export interface BotCommand {
+  command: string;
+  description: string;
 }
 
 export interface TelegramFile {

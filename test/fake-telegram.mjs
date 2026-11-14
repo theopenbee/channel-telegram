@@ -78,6 +78,11 @@ export async function startFakeTelegram(handlers = {}) {
         pollers.push(poller);
         return;
       }
+      case "sendMessage":
+        return send(200, {
+          ok: true,
+          result: { message_id: calls.length, date: 1, chat: { id: call.body.chat_id, type: "private" }, text: call.body.text },
+        });
       case "getFile":
         return send(200, { ok: true, result: { file_id: call.body.file_id, file_path: `files/${call.body.file_id}` } });
       default:

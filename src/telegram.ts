@@ -4,7 +4,10 @@ import { ConfigError, type Attachment, type ChannelContext, type ChannelDefiniti
 
 import { BotApi, DEFAULT_API_BASE_URL, TelegramError, isRetryableDownload, retryWithBackoff, sleep } from "./api.js";
 import { AuthStore, codeMatches } from "./auth.js";
+import { ButtonStore, buttonIndex, expiredText, inlineKeyboard, notOwnerText, scopeUser, selectedNote } from "./buttons.js";
+import { COMMAND_LANGUAGES, botCommands, stripCommandTarget } from "./commands.js";
 import {
+  TELEGRAM_MESSAGE_LIMIT,
   chunkText,
   encodeRaw,
   extension,
@@ -19,7 +22,7 @@ import {
   uploadField,
   type Target,
 } from "./helpers.js";
-import type { Message, TelegramFile, Update, User, WebhookInfo } from "./types.js";
+import type { CallbackQuery, Message, TelegramFile, Update, User, WebhookInfo } from "./types.js";
 
 const DEFAULT_MAX_MEDIA_SIZE = 50 * 1024 * 1024;
 const POLL_TIMEOUT_SECONDS = 50;
@@ -28,8 +31,6 @@ const MIN_POLL_BACKOFF = 1000;
 const MAX_POLL_BACKOFF = 30_000;
 const DOWNLOAD_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_DELAY = 500;
-
-const BOT_COMMANDS = [{ command: "clear", description: "Clear conversation history" }];
 
 interface TelegramConfig {
   token: string;
@@ -59,6 +60,8 @@ export function createTelegramChannel(): ChannelDefinition {
   let api: BotApi | undefined;
   let cfg: TelegramConfig;
   let auth: AuthStore | undefined;
+  let buttons: ButtonStore | undefined;
+  let username = "";
 
   const reply = async (ctx: ChannelContext, m: Message, text: string) => {
     try {
@@ -145,7 +148,7 @@ export function createTelegramChannel(): ChannelDefinition {
       ctx.log.debug("send typing action failed", { error: errorText(err) });
     });
 
-    const text = m.text ?? m.caption ?? "";
+    const text = stripCommandTarget(m.text ?? m.caption ?? "", username);
     const attachments = await downloadAttachment(ctx, m, signal);
     if (!text && attachments.length === 0) return;
 
@@ -167,6 +170,67 @@ export function createTelegramChannel(): ChannelDefinition {
     });
   };
 
+  const answerCallback = (ctx: ChannelContext, cq: CallbackQuery, text?: string) =>
+    api!.call("answerCallbackQuery", text ? { callback_query_id: cq.id, text } : { callback_query_id: cq.id }).catch((err) => {
+      ctx.log.warn("answer callback query failed", { error: errorText(err) });
+    });
+
+  const closeButtons = async (ctx: ChannelContext, m: Message, note?: string) => {
+    const text = note && m.text ? `${m.text}\n\n${note}` : undefined;
+    try {
+      if (text && text.length <= TELEGRAM_MESSAGE_LIMIT) {
+        await api!.call("editMessageText", { chat_id: m.chat.id, message_id: m.message_id, text });
+      } else {
+        await api!.call("editMessageReplyMarkup", { chat_id: m.chat.id, message_id: m.message_id, reply_markup: { inline_keyboard: [] } });
+      }
+    } catch (err) {
+      ctx.log.warn("remove buttons failed", { message_id: m.message_id, error: errorText(err) });
+    }
+  };
+
+  const handleCallback = async (ctx: ChannelContext, update: Update, cq: CallbackQuery) => {
+    const m = cq.message;
+    const index = buttonIndex(cq.data);
+    if (!m || !m.date || index === undefined) {
+      await answerCallback(ctx, cq);
+      return;
+    }
+    const entry = buttons?.get(m.chat.id, m.message_id);
+    const text = entry?.texts[index];
+    if (!entry || !text) {
+      await answerCallback(ctx, cq, expiredText(ctx.language));
+      await closeButtons(ctx, m);
+      return;
+    }
+    const senderId = String(cq.from.id);
+    if (scopeUser(entry.scope) !== senderId || (auth && !auth.isAuthorized(senderId))) {
+      await answerCallback(ctx, cq, notOwnerText(ctx.language));
+      return;
+    }
+    await buttons!.remove(m.chat.id, m.message_id);
+    await answerCallback(ctx, cq);
+
+    const threadId = topicThreadId(m);
+    api!.call("sendChatAction", { chat_id: m.chat.id, message_thread_id: threadId, action: "typing" }).catch((err) => {
+      ctx.log.debug("send typing action failed", { error: errorText(err) });
+    });
+    const context: Record<string, unknown> = { chat_type: m.chat.type, sender_name: [cq.from.first_name, cq.from.last_name].filter(Boolean).join(" ") };
+    if (m.chat.title) context.chat_title = m.chat.title;
+    if (cq.from.username) context.sender_username = cq.from.username;
+    if (threadId) context.message_thread_id = threadId;
+    ctx.dispatch({
+      chat_id: String(m.chat.id),
+      sender_id: senderId,
+      session_scope: entry.scope,
+      message_id: `button:${m.chat.id}:${m.message_id}`,
+      text,
+      raw: encodeRaw(update.update_id, m),
+      context,
+      time: Date.now(),
+    });
+    await closeButtons(ctx, m, selectedNote(ctx.language, entry.labels[index] ?? text));
+  };
+
   const poll = async (ctx: ChannelContext, signal: AbortSignal) => {
     let offset = 0;
     let backoff = MIN_POLL_BACKOFF;
@@ -175,7 +239,7 @@ export function createTelegramChannel(): ChannelDefinition {
       try {
         updates = await api!.call<Update[]>(
           "getUpdates",
-          { offset, timeout: POLL_TIMEOUT_SECONDS, allowed_updates: ["message"] },
+          { offset, timeout: POLL_TIMEOUT_SECONDS, allowed_updates: ["message", "callback_query"] },
           signal,
           POLL_REQUEST_TIMEOUT,
         );
@@ -190,11 +254,11 @@ export function createTelegramChannel(): ChannelDefinition {
       }
       for (const update of updates) {
         offset = update.update_id + 1;
-        if (!update.message) continue;
         try {
-          await handleMessage(ctx, update, update.message, signal);
+          if (update.message) await handleMessage(ctx, update, update.message, signal);
+          else if (update.callback_query) await handleCallback(ctx, update, update.callback_query);
         } catch (err) {
-          ctx.log.error("handle message failed", { error: errorText(err) });
+          ctx.log.error("handle update failed", { error: errorText(err) });
         }
       }
     }
@@ -218,11 +282,14 @@ export function createTelegramChannel(): ChannelDefinition {
     }
   };
 
-  const deliver = async (msg: SendRequest, target: Target, signal: AbortSignal): Promise<Message | undefined> => {
+  const deliver = async (ctx: ChannelContext, msg: SendRequest, target: Target, signal: AbortSignal): Promise<Message | undefined> => {
     let replyTo = target.replyTo;
     let last: Message | undefined;
-    for (const chunk of chunkText(msg.content ?? "")) {
+    const chunks = chunkText(msg.content ?? "");
+    const withButtons = msg.buttons?.length && buttons ? msg.buttons : undefined;
+    for (const [i, chunk] of chunks.entries()) {
       if (signal.aborted) throw new Error("send cancelled");
+      const keyboard = withButtons && i === chunks.length - 1 ? { inline_keyboard: inlineKeyboard(withButtons) } : undefined;
       last = await api!.call<Message>(
         "sendMessage",
         {
@@ -230,10 +297,16 @@ export function createTelegramChannel(): ChannelDefinition {
           message_thread_id: target.threadId,
           text: chunk,
           reply_parameters: replyTo ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
+          reply_markup: keyboard,
         },
         signal,
       );
       replyTo = undefined;
+      if (keyboard) {
+        await buttons!.add(last.chat.id, last.message_id, msg.session_scope, withButtons!).catch((err) => {
+          ctx.log.error("store buttons failed", { message_id: last!.message_id, error: errorText(err) });
+        });
+      }
     }
     if (msg.media) {
       if (signal.aborted) throw new Error("send cancelled");
@@ -243,6 +316,7 @@ export function createTelegramChannel(): ChannelDefinition {
   };
 
   return {
+    capabilities: { buttons: true },
     async start(ctx) {
       cfg = readConfig(ctx.config);
       api = new BotApi(cfg.token, cfg.apiBaseUrl);
@@ -253,16 +327,23 @@ export function createTelegramChannel(): ChannelDefinition {
         if (isTokenRejected(err)) throw new ConfigError("Telegram rejected the bot token");
         throw err;
       }
+      username = me.username ?? "";
+      const openedButtons = await ButtonStore.open(ctx.dataDir);
+      buttons = openedButtons.store;
+      if (openedButtons.problem) ctx.log.error("cannot read stored buttons, starting with none", { error: openedButtons.problem });
       if (cfg.authCode) {
         const opened = await AuthStore.open(ctx.dataDir);
         auth = opened.store;
         if (opened.problem) ctx.log.error("cannot read authorized users, starting with none", { error: opened.problem });
         if (opened.imported) ctx.log.info("imported authorized users from the built-in channel", { count: auth.size });
       }
-      try {
-        await api.call("setMyCommands", { commands: BOT_COMMANDS });
-      } catch (err) {
-        ctx.log.error("failed to set bot commands", { error: errorText(err) });
+      for (const language of COMMAND_LANGUAGES) {
+        const params = { commands: botCommands(language, Boolean(cfg.authCode)), ...(language === "en" ? {} : { language_code: language }) };
+        try {
+          await api.call("setMyCommands", params);
+        } catch (err) {
+          ctx.log.error("failed to set bot commands", { language, error: errorText(err) });
+        }
       }
       const webhook = await api.call<WebhookInfo>("getWebhookInfo");
       if (webhook.url) {
@@ -290,12 +371,12 @@ export function createTelegramChannel(): ChannelDefinition {
       const target = (!msg.proactive && targetFromRaw(msg.reply_to?.raw)) || targetFromSession(msg.chat_id, msg.session_scope);
       let sent: Message | undefined;
       try {
-        sent = await deliver(msg, target, signal);
+        sent = await deliver(ctx, msg, target, signal);
       } catch (err) {
         const to = err instanceof TelegramError ? err.parameters.migrate_to_chat_id : undefined;
         if (to === undefined) throw err;
         ctx.migrateChat(String(target.chatId), String(to));
-        sent = await deliver(msg, { chatId: to }, signal);
+        sent = await deliver(ctx, msg, { chatId: to }, signal);
       }
       return sent ? { platform_message_id: String(sent.message_id) } : {};
     },
